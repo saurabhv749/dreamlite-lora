@@ -41,6 +41,7 @@ def parse_args():
     parser.add_argument("--train_batch_size", type=int, default=1, help="Batch size only can be 1 here.")
     parser.add_argument("--max_train_steps", type=int, default=3500)
     parser.add_argument("--default_prompt", type=str, default="transfer the image into Snoopy style")
+    parser.add_argument("--low-vram", action="store_true", help="Keep the text encoder on CPU and move it only around prompt encoding to reduce VRAM usage.")
     return parser.parse_args()
 
 
@@ -176,7 +177,11 @@ def main():
     unet, optimizer, dataloader = accelerator.prepare(unet, optimizer, dataloader)
 
     vae.to(accelerator.device, dtype=dtype)
-    text_encoder.to(accelerator.device, dtype=dtype)
+    text_encoder.eval()
+    if args.low_vram:
+        text_encoder.to("cpu")
+    else:
+        text_encoder.to(accelerator.device, dtype=dtype)
 
     # 7. Train
     global_step = 0
@@ -218,13 +223,27 @@ def main():
                 noisy_latents = (1.0 - sigmas_expanded) * latents + sigmas_expanded * noise
 
                 # 4. Encode Prompt
-                prompt_embeds, text_attention_mask = pipe.encode_prompt(
-                    mode="edit",
-                    image=conds_pil,
-                    prompts=prompts,
-                    device=accelerator.device,
-                    dtype=dtype,
-                )
+                if args.low_vram:
+                    text_encoder.to(accelerator.device, dtype=dtype)
+                    with torch.no_grad():
+                        prompt_embeds, text_attention_mask = pipe.encode_prompt(
+                            mode="edit",
+                            image=conds_pil,
+                            prompts=prompts,
+                            device=accelerator.device,
+                            dtype=dtype,
+                        )
+                    text_encoder.to("cpu")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                else:
+                    prompt_embeds, text_attention_mask = pipe.encode_prompt(
+                        mode="edit",
+                        image=conds_pil,
+                        prompts=prompts,
+                        device=accelerator.device,
+                        dtype=dtype,
+                    )
 
                 # 5. Time IDs, Image Latents
                 # Generate mode, condition image = 0
