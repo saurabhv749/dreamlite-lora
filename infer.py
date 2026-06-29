@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import torch
 from safetensors.torch import load_file
 from dreamlite import DreamLitePipelineLoRA
@@ -20,11 +21,12 @@ from PIL import Image
 from peft import PeftModel
 
 pipe = DreamLitePipelineLoRA.from_pretrained("models/DreamLite-base", torch_dtype=torch.bfloat16).to("cuda")
+os.makedirs("lora-outputs", exist_ok=True)
 
-
-image_path = "output/cat.jpg"
+image_path = ""
 prompt = ""
-lora_path = "output/output_lora/yarn"
+lora_path = ""
+steps=28
 
 # 1. Load LoRA Weights
 input_image = Image.open(image_path)  # for Edit lora
@@ -37,11 +39,11 @@ pipe.unet = PeftModel.from_pretrained(pipe.unet, lora_path)
 image = pipe(
     prompt=prompt, 
     image=input_image,
-    num_inference_steps=28,
+    num_inference_steps=steps,
     image_guidance_scale=1.5
 ).images[0]
 
 # (1024, 1024) -> image ar
-image.save("output/lora.jpg")
+image.save("lora-outputs/image.jpg")
 resized_image = image.resize((w,h))
-resized_image.save("output/lora-resized.jpg")
+resized_image.save("lora-outputs/image-resized.jpg")

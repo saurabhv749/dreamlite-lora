@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# source: ByteVisionLab/DreamLite [commit]: a6e20c8
 
 import os
 import argparse
@@ -24,11 +25,12 @@ from datasets import load_dataset
 from torchvision import transforms
 
 from accelerate import Accelerator
-from diffusers.optimization import get_scheduler
 from peft import LoraConfig, get_peft_model
+import bitsandbytes as bnb
 
-# 导入你的核心组件
 from dreamlite import DreamLitePipelineLoRA
+from diffusers.models.unets import DreamLiteUNetModel
+from transformers import BitsAndBytesConfig
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train LoRA for DreamLite")
@@ -37,29 +39,24 @@ def parse_args():
     parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument("--output_dir", type=str, default="./output/output_lora/edit_Snoopy")
     parser.add_argument("--rank", type=int, default=16, help="LoRA Rank")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Number of steps for gradient accumulation")
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--train_batch_size", type=int, default=1, help="Batch size only can be 1 here.")
+    parser.add_argument( "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes.")
+    parser.add_argument( "--gradient_checkpointing", action="store_true", help="Whether or not to use gradient checkpointing.")
     parser.add_argument("--max_train_steps", type=int, default=3500)
-    parser.add_argument("--default_prompt", type=str, default="transfer the image into Snoopy style")
-    parser.add_argument("--low-vram", action="store_true", help="Keep the text encoder on CPU and move it only around prompt encoding to reduce VRAM usage.")
     return parser.parse_args()
-
 
 
 def main():
     args = parse_args()
 
     if torch.cuda.is_available():
-        if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
-            dtype = torch.bfloat16
-            precision = "bf16"
-            print("Using bfloat16 (BF16)")
-        else:
-            dtype = torch.float16
-            precision = "fp16"
-            print("Using float16 (FP16)")
+        dtype = torch.float16
+        precision = "fp16"
+        print("Using float16 (FP16)")
     else:
-        # Fallback to float32 for CPU or if neither bf16 nor fp16 are suitable
+        # Fallback to float32 for CPU
         dtype = torch.float32
         precision=None
         print("Using float32 (FP32)")
@@ -67,7 +64,7 @@ def main():
     # 1. Initialize Accelerator
     accelerator = Accelerator(
         mixed_precision=precision,
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
     
     # 2. Load DreamLite Pipeline
@@ -75,10 +72,28 @@ def main():
     
     text_encoder = pipe.text_encoder
     vae = pipe.vae
-    unet = pipe.unet
-    noise_scheduler = pipe.scheduler
+    # we will load unet with 4-bit quantization, so we can delete the original unet to save memory
+    del pipe.unet
 
-    # Frozen other modules
+    q_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=dtype,
+    )
+    unet = DreamLiteUNetModel.from_pretrained(
+        args.model_id,
+        subfolder='unet',
+        torch_dtype=dtype,
+        quantization_config=q_config,
+        device_map="auto",
+        )
+
+    # Enable gradient checkpointing for memory efficiency
+    # this fixes cuda out of memory error on google colab with 16GB GPU
+    if args.gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
+
+    # Freeze all modules
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
@@ -95,18 +110,20 @@ def main():
         ],
     )
     unet = get_peft_model(unet, lora_config)
-    
-    # print
     unet.print_trainable_parameters()
 
-    # 4. configure optimizer
-    optimizer = torch.optim.AdamW(
+    # 4. optimizer
+    if args.use_8bit_adam:
+        optimizer_class = bnb.optim.AdamW8bit
+    else:
+        optimizer_class = torch.optim.AdamW
+    optimizer = optimizer_class(
         filter(lambda p: p.requires_grad, unet.parameters()),
         lr=args.learning_rate,
         weight_decay=1e-4,
     )
     
-    # 5. prepare dataloader
+    # 5. Dataloader
     # =======================================================
     print("Loading dataset...")
     train_dataset = load_dataset(args.dataset_id, split=args.dataset_split)
@@ -123,29 +140,24 @@ def main():
         source_imgs = []
         source_imgs_pil = []
         
-        # 1. 处理图片 (tar 列)
         for tar_item in examples["tar"]:
-            # 情况 A: HF Dataset 已经自动把它解析成了 PIL Image 对象
             if hasattr(tar_item, "convert"):
                 img = tar_item.convert("RGB")
             else:
-                raise ValueError(f"无法识别的图像格式: {type(tar_item)}")
-                
+                raise ValueError(f"Unrecognized image format: {type(tar_item)}")
+            
             target_imgs.append(image_transforms(img))
 
-        for tar_item in examples["src"]:
-            # 情况 A: HF Dataset 已经自动把它解析成了 PIL Image 对象
-            if hasattr(tar_item, "convert"):
-                img = tar_item.convert("RGB")
+        for src_item in examples["src"]:
+            if hasattr(src_item, "convert"):
+                img = src_item.convert("RGB")
             else:
-                raise ValueError(f"无法识别的图像格式: {type(tar_item)}")
+                raise ValueError(f"Unrecognized image format: {type(src_item)}")
                 
             source_imgs_pil.append(img)
             source_imgs.append(image_transforms(img))
         
-        # 2. 处理文本 (prompt 列)
         prompts = examples["prompt"]
-        # prompts = [args.default_prompt] * len(examples["prompt"])
                 
         return {
             "target_imgs": target_imgs,
@@ -161,7 +173,12 @@ def main():
         source_imgs = torch.stack([example["source_imgs"] for example in examples])
         prompts = [example["prompt"] for example in examples]
         source_imgs_pil = [example["source_imgs_pil"] for example in examples]
-        return {"target_imgs": target_imgs, "source_imgs": source_imgs, "source_imgs_pil": source_imgs_pil, "prompts": prompts}
+        return {
+            "target_imgs": target_imgs,
+            "source_imgs": source_imgs,
+            "source_imgs_pil": source_imgs_pil,
+            "prompts": prompts
+            }
 
     dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -173,28 +190,20 @@ def main():
     # =======================================================
 
     # 6. Accelerator
-    # unet, optimizer = accelerator.prepare(unet, optimizer)
     unet, optimizer, dataloader = accelerator.prepare(unet, optimizer, dataloader)
 
     vae.to(accelerator.device, dtype=dtype)
-    text_encoder.eval()
-    if args.low_vram:
-        text_encoder.to("cpu")
-    else:
-        text_encoder.to(accelerator.device, dtype=dtype)
+    text_encoder.to(accelerator.device, dtype=dtype)
 
     # 7. Train
     global_step = 0
     progress_bar = tqdm(total=args.max_train_steps, disable=not accelerator.is_local_main_process)
     
     unet.train()
-    
+
     while global_step < args.max_train_steps:
         # =======================================================
-        # TODO: get data from DataLoader
-        # for batch in dataloader:
-        #     images = batch["pixel_values"]
-        #     prompts = batch["text"]
+
         for batch in dataloader:
             if global_step >= args.max_train_steps:
                 break
@@ -223,27 +232,13 @@ def main():
                 noisy_latents = (1.0 - sigmas_expanded) * latents + sigmas_expanded * noise
 
                 # 4. Encode Prompt
-                if args.low_vram:
-                    text_encoder.to(accelerator.device, dtype=dtype)
-                    with torch.no_grad():
-                        prompt_embeds, text_attention_mask = pipe.encode_prompt(
-                            mode="edit",
-                            image=conds_pil,
-                            prompts=prompts,
-                            device=accelerator.device,
-                            dtype=dtype,
-                        )
-                    text_encoder.to("cpu")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                else:
-                    prompt_embeds, text_attention_mask = pipe.encode_prompt(
-                        mode="edit",
-                        image=conds_pil,
-                        prompts=prompts,
-                        device=accelerator.device,
-                        dtype=dtype,
-                    )
+                prompt_embeds, text_attention_mask = pipe.encode_prompt(
+                    mode="edit",
+                    image=conds_pil,
+                    prompts=prompts,
+                    device=accelerator.device,
+                    dtype=dtype,
+                )
 
                 # 5. Time IDs, Image Latents
                 # Generate mode, condition image = 0
